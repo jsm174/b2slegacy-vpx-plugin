@@ -1,0 +1,8 @@
+build/
+build-*/
+external/
+third-party/include/*
+!third-party/include/.gitkeep
+third-party/runtime-libs/*/*
+!third-party/runtime-libs/*/.gitkeep
+.DS_Store

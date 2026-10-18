@@ -1,0 +1,144 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64,           os: ubuntu-24.04,     cmake_platform: "" }
+          - { platform: linux-aarch64,       os: ubuntu-24.04-arm, cmake_platform: "" }
+          - { platform: windows-x64,         os: windows-2025-vs2026, cmake_platform: "" }
+          - { platform: windows-x86,         os: windows-2025-vs2026, cmake_platform: "" }
+          - { platform: windows-mingw-x64,   os: windows-latest,   cmake_platform: "" }
+          - { platform: macos-arm64,         os: macos-15,         cmake_platform: "" }
+          - { platform: ios-arm64,           os: macos-26,         cmake_platform: ios }
+          - { platform: ios-simulator-arm64, os: macos-26,         cmake_platform: ios-simulator }
+          - { platform: android-arm64-v8a,   os: ubuntu-24.04,     cmake_platform: android }
+
+    steps:
+      - if: startsWith(matrix.platform, 'linux')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates pkg-config curl \
+            libdrm-dev libgbm-dev libegl-dev libgl1-mesa-dev libwayland-dev libwayland-egl-backend-dev \
+            libudev-dev libx11-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libxrandr-dev libasound2-dev libpipewire-0.3-dev
+
+      - if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'ios')
+        run: brew install cmake
+
+      - if: matrix.platform == 'windows-x64' || matrix.platform == 'windows-x86'
+        uses: microsoft/setup-msbuild@v3
+
+      - if: startsWith(matrix.platform, 'windows-mingw')
+        uses: actions/cache@v6
+        with:
+          path: C:\msys64\var\cache\pacman\pkg
+          key: pacman-${{ matrix.platform }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            pacman-${{ matrix.platform }}-
+
+      - if: startsWith(matrix.platform, 'windows-mingw')
+        run: |
+          /c/msys64/usr/bin/bash.exe -l -c "pacman -S --noconfirm --needed \
+            git curl tar \
+            mingw-w64-ucrt-x86_64-gcc \
+            mingw-w64-ucrt-x86_64-cmake \
+            mingw-w64-ucrt-x86_64-make"
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Version
+        run: |
+          VERSION_MAJOR=$(grep -Eo "B2SLEGACY_PLUGIN_VERSION_MAJOR\s+[0-9]+" src/B2SLegacyVersion.h | grep -Eo "[0-9]+$")
+          VERSION_MINOR=$(grep -Eo "B2SLEGACY_PLUGIN_VERSION_MINOR\s+[0-9]+" src/B2SLegacyVersion.h | grep -Eo "[0-9]+$")
+          VERSION_PATCH=$(grep -Eo "B2SLEGACY_PLUGIN_VERSION_PATCH\s+[0-9]+" src/B2SLegacyVersion.h | grep -Eo "[0-9]+$")
+          REVISION=$(git rev-list --count HEAD)
+          SHA_SHORT=$(git rev-parse --short "${GITHUB_SHA}")
+          echo "ARTIFACT_NAME=b2slegacy-vpx-plugin-${{ matrix.platform }}-${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${REVISION}-${SHA_SHORT}" >> $GITHUB_ENV
+          perl -i -pe"s/9999/${REVISION}/g" src/B2SLegacyVersion.h
+          perl -i -pe"s/unknown/${SHA_SHORT}/g" src/B2SLegacyVersion.h
+
+      - name: Cache staged dependencies
+        uses: actions/cache@v6
+        with:
+          path: external
+          key: external-${{ matrix.platform }}-${{ hashFiles('platforms/config.sh', format('platforms/{0}/external.sh', matrix.platform)) }}
+          restore-keys: |
+            external-${{ matrix.platform }}-
+
+      - name: Stage dependencies
+        run: |
+          if [[ "${{ matrix.platform }}" == windows-mingw-* ]]; then
+            CURRENT_DIR="$(pwd)"
+            MSYSTEM=UCRT64 /c/msys64/usr/bin/bash.exe -l -c "
+              cd \"${CURRENT_DIR}\" &&
+              platforms/${{ matrix.platform }}/external.sh
+            "
+          else
+            platforms/${{ matrix.platform }}/external.sh
+          fi
+
+      - name: Build plugin
+        run: |
+          if [[ "${{ matrix.platform }}" == windows-mingw-* ]]; then
+            CURRENT_DIR="$(pwd)"
+            MSYSTEM=UCRT64 /c/msys64/usr/bin/bash.exe -l -c "
+              cd \"${CURRENT_DIR}\" &&
+              cmake -DCMAKE_BUILD_TYPE=Release -B build &&
+              cmake --build build -- -j\$(nproc)
+            "
+          elif [[ "${{ matrix.platform }}" == windows-x64 ]]; then
+            cmake -G "Visual Studio 18 2026" -A x64 -B build
+            cmake --build build --config Release --parallel
+          elif [[ "${{ matrix.platform }}" == windows-x86 ]]; then
+            cmake -G "Visual Studio 18 2026" -A Win32 -B build
+            cmake --build build --config Release --parallel
+          elif [[ "${{ matrix.platform }}" == macos-* || "${{ matrix.platform }}" == ios-* ]]; then
+            cmake -DPLATFORM=${{ matrix.cmake_platform }} -DCMAKE_BUILD_TYPE=Release -B build
+            cmake --build build -- -j$(sysctl -n hw.ncpu)
+          else
+            cmake -DPLATFORM=${{ matrix.cmake_platform }} -DCMAKE_BUILD_TYPE=Release -B build
+            cmake --build build -- -j$(nproc)
+          fi
+
+      - name: Package
+        working-directory: build
+        run: |
+          rm -rf stage
+          mkdir stage
+          cp -R b2slegacy stage/b2slegacy
+
+          if [[ "${{ matrix.platform }}" == windows-* ]]; then
+            cd stage && 7z a -r ../${ARTIFACT_NAME}.zip .
+          else
+            tar czf ${ARTIFACT_NAME}.tar.gz -C stage .
+          fi
+
+      - name: Upload ${{ matrix.platform }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: build/${{ env.ARTIFACT_NAME }}.*
+          if-no-files-found: error
+          archive: false
+          retention-days: 30
